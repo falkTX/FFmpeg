@@ -38,7 +38,7 @@
 /**
  * Size of the internal FIFO buffers as a number of audio packets
  */
-#define FIFO_PACKETS_NUM 4
+#define FIFO_PACKETS_NUM 16
 
 typedef struct JackData {
     AVClass        *class;

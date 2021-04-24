@@ -35,7 +35,7 @@
 /**
  * Maximum number of "packets" of audio to queue in ringbuffer
  */
-#define RINGBUFFER_NUM_PACKETS 8
+#define RINGBUFFER_NUM_PACKETS 16
 
 typedef struct JackData {
     AVClass*           class;
@@ -111,6 +111,13 @@ static int start_jack(AVFormatContext *context)
     JackData *self = context->priv_data;
     int i;
 
+#ifdef __MOD_DEVICES__
+    if (self->nports != 1) {
+        av_log(context, AV_LOG_ERROR, "Mono layout only\n");
+        return AVERROR(EIO);
+    }
+#endif
+
     /* Register as a JACK client, using the context url as client name. */
     self->client = jack_client_open(context->url, JackNullOption, NULL);
     if (!self->client) {
@@ -136,11 +143,18 @@ static int start_jack(AVFormatContext *context)
 
     /* Register JACK ports */
     for (i = 0; i < self->nports; i++) {
+#ifdef __MOD_DEVICES__
+        char* str = context->url;
+        self->ports[i] = jack_port_register(self->client, context->url,
+                                            JACK_DEFAULT_AUDIO_TYPE,
+                                            JackPortIsOutput|JackPortIsTerminal|JackPortIsPhysical, 0);
+#else
         char str[16];
         snprintf(str, sizeof(str), "output_%d", i + 1);
         self->ports[i] = jack_port_register(self->client, str,
                                             JACK_DEFAULT_AUDIO_TYPE,
                                             JackPortIsOutput, 0);
+#endif
         if (!self->ports[i]) {
             av_log(context, AV_LOG_ERROR, "Unable to register port %s:%s\n",
                    context->url, str);

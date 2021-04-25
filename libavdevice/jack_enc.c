@@ -40,7 +40,6 @@
 typedef struct JackData {
     AVClass*           class;
     jack_client_t*     client;
-    int                activated;
     sem_t              packet_count;
     jack_nframes_t     sample_rate;
     jack_nframes_t     buffer_size;
@@ -168,14 +167,22 @@ static int start_jack(AVFormatContext *context)
     jack_on_shutdown(self->client, shutdown_callback, self);
     jack_set_xrun_callback(self->client, xrun_callback, self);
 
+    if (!jack_activate(self->client)) {
+        av_log(context, AV_LOG_INFO,
+               "JACK client registered and activated (rate=%dHz, buffer_size=%d frames)\n",
+               self->sample_rate, self->buffer_size);
+    } else {
+        av_log(context, AV_LOG_ERROR, "Unable to activate JACK client\n");
+        return AVERROR(EIO);
+    }
+
     return 0;
 }
 
 static void stop_jack(JackData *self)
 {
     if (self->client) {
-        if (self->activated)
-            jack_deactivate(self->client);
+        jack_deactivate(self->client);
         jack_client_close(self->client);
     }
     sem_destroy(&self->packet_count);
@@ -215,62 +222,49 @@ static int audio_write_packet(AVFormatContext *context, AVPacket *pkt)
 {
     JackData *self = context->priv_data;
     struct timespec timeout = {0, 0};
-    int should_activate = 0;
+    AVPacket pkt2;
 
-    /* Check packet size */
-    if (pkt->size > self->audio_pkt_size * (RINGBUFFER_NUM_PACKETS/2)) {
-        av_log(context, AV_LOG_ERROR, "Packet is too big! (%u)\n", pkt->size);
-        return AVERROR(EIO);
-    }
-
-    /* Check if there's enough space to send */
-    if (jack_ringbuffer_write_space(self->ringbuffer)+1 < pkt->size) {
-        av_log(context, AV_LOG_WARNING, "Audio source packet overrun, space left %lu\n",
-               jack_ringbuffer_write_space(self->ringbuffer));
-        if (!self->activated) {
-            should_activate = 1;
-        }
-    } else {
-        /* Write the packet to later be used by process_callback() */
+    /* Check if there's enough space to send everything as-is */
+    if (jack_ringbuffer_write_space(self->ringbuffer) >= pkt->size) {
         jack_ringbuffer_write(self->ringbuffer, pkt->data, pkt->size);
-        if (!self->activated && jack_ringbuffer_write_space(self->ringbuffer)+1 >= pkt->size) {
-            should_activate = 1;
-        }
-    }
 
-    /* Activate the JACK client after a few packet writes. */
-    if (should_activate) {
-        if (!jack_activate(self->client)) {
-            self->activated = 1;
-            av_log(context, AV_LOG_INFO,
-                   "JACK client registered and activated (rate=%dHz, buffer_size=%d frames)\n",
-                   self->sample_rate, self->buffer_size);
-        } else {
-            av_log(context, AV_LOG_ERROR, "Unable to activate JACK client\n");
-            return AVERROR(EIO);
-        }
-    }
-
-    if (self->activated) {
+    /* not everything fits, keep writing and waiting until the entire packet is in the ringbuffer */
+    } else {
         timeout.tv_sec = av_gettime() / 1000000 + 2;
+        memcpy(&pkt2, pkt, sizeof(pkt2));
 
-        while (jack_ringbuffer_write_space(self->ringbuffer) < self->audio_pkt_size * (RINGBUFFER_NUM_PACKETS/2)) {
-            if (sem_timedwait(&self->packet_count, &timeout)) {
-                if (errno == ETIMEDOUT) {
-                    av_log(context, AV_LOG_ERROR,
-                           "Input error: timed out when waiting for JACK process callback input\n");
+        while (pkt2.size) {
+            if (pkt2.size >= self->audio_pkt_size) {
+                /* write one pkt size chunk at a time */
+                if (jack_ringbuffer_write_space(self->ringbuffer) >= self->audio_pkt_size) {
+                    jack_ringbuffer_write(self->ringbuffer, pkt2.data, self->audio_pkt_size);
+                    pkt2.data += self->audio_pkt_size;
+                    pkt2.size -= self->audio_pkt_size;
                 } else {
-                    char errbuf[128];
-                    int ret = AVERROR(errno);
-                    av_strerror(ret, errbuf, sizeof(errbuf));
-                    av_log(context, AV_LOG_ERROR, "Error while waiting for audio packet: %s\n",
-                           errbuf);
-                }
-                if (!self->client) {
-                    av_log(context, AV_LOG_ERROR, "Input error: JACK server is gone\n");
-                }
+                    if (sem_timedwait(&self->packet_count, &timeout)) {
+                        if (errno == ETIMEDOUT) {
+                            av_log(context, AV_LOG_ERROR,
+                                   "Input error: timed outzz when waiting for JACK process callback input\n");
+                        } else {
+                            char errbuf[128];
+                            int ret = AVERROR(errno);
+                            av_strerror(ret, errbuf, sizeof(errbuf));
+                            av_log(context, AV_LOG_ERROR, "Error while waiting for audio packet: %s\n",
+                                   errbuf);
+                        }
+                        if (!self->client) {
+                            av_log(context, AV_LOG_ERROR, "Input error: JACK server is gone\n");
+                        }
 
-                return AVERROR(EIO);
+                        return AVERROR(EIO);
+                    }
+                }
+            } else {
+                /* final step, only a few samples remain, we just spin spin */
+                /* FIXME would it be okay to do timed wait here? processing side will post */
+                while (jack_ringbuffer_write_space(self->ringbuffer) < pkt2.size) {}
+                jack_ringbuffer_write(self->ringbuffer, pkt2.data, pkt2.size);
+                break;
             }
         }
     }
